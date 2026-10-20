@@ -4,3 +4,4 @@ na_*/
 *_screened/
 dashboard_cache/
 *.html
+__pycache__/
