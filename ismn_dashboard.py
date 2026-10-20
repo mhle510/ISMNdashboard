@@ -25,6 +25,14 @@ Usage
 python ismn_dashboard.py --ismn-dir ./na_ismn \
     --output ismn_insitu_dashboard.html
 
+Type II screened data (manual screening, screen_apply.R):
+python ismn_dashboard.py --ismn-dir ./na_combined_v2_lifted_warm75_screened \
+    --output na_ismn_umrb_screened.html
+  Detected automatically when the files have the column sm_qaqc_screen (or force
+  it with --screened): a day counts when sm_qaqc_screen has a value. Without
+  metadata_all_depths.csv, station coordinates come from the meta_depth_*.csv
+  files inside the depth folders.
+
 Optional: --exclude-networks SNOTEL ARM, --blacklist blacklist_stns.csv,
           --start-date / --end-date (default 2002-01-01 .. 2024-12-31),
           --freq W (weekly means, smaller file).
@@ -35,6 +43,7 @@ Author: Sujay Kumar; Oct 2026
 """
 
 import argparse
+from functools import partial
 import base64
 import csv
 import gzip
@@ -72,8 +81,17 @@ RZ_LAYERS = [                       # (candidate depths in order, weight)
 ]
 
 
-def _read_ismn_csv(fpath):
+SCREENED = False                    # set by --screened: read sm_qaqc_screen
+
+
+def _read_ismn_csv(fpath, screened=False):
     try:
+        if screened:                # Type II screened files: removed days are already NA
+            d = pd.read_csv(fpath, parse_dates=["date"],
+                            usecols=["site_id", "date", "sm_qaqc_screen"])
+            d = d.rename(columns={"sm_qaqc_screen": "sm_qaqc"})
+            d["sm_flag"] = np.where(d["sm_qaqc"].notna(), "0", "-1")
+            return d
         return pd.read_csv(fpath, parse_dates=["date"], dtype={"sm_flag": str},
                            usecols=["site_id", "date", "sm_qaqc", "sm_flag"])
     except Exception as e:
@@ -96,9 +114,9 @@ def load_ismn_depth_wide(ismn_dir, depth, start, end, workers):
     if workers > 1:
         from multiprocessing import Pool
         with Pool(min(workers, len(files))) as pool:
-            dfs = pool.map(_read_ismn_csv, files)
+            dfs = pool.map(partial(_read_ismn_csv, screened=SCREENED), files)
     else:
-        dfs = [_read_ismn_csv(f) for f in files]
+        dfs = [_read_ismn_csv(f, SCREENED) for f in files]
     dfs = [d for d in dfs if not d.empty]
     if not dfs:
         return pd.DataFrame()
@@ -118,7 +136,7 @@ def build_rootzone_wide(by_depth):
             if dname in by_depth and not by_depth[dname].empty:
                 pieces.append(by_depth[dname] * w)
                 break
-    if not pieces:
+    if len(pieces) < len(RZ_LAYERS):     # a layer is missing (e.g. only 5 cm screened yet)
         return pd.DataFrame()
     comb = pd.concat(pieces, axis=1, keys=range(len(pieces)))
     return comb.T.groupby(level=1).sum(min_count=len(pieces)).T
@@ -142,7 +160,7 @@ def load_obs(args, start, end):
     """Surface and root-zone obs, wide (date x site_id). Cached per date
     range in --cache-dir after the first run."""
     os.makedirs(args.cache_dir, exist_ok=True)
-    tag = f"{start:%Y%m%d}_{end:%Y%m%d}"
+    tag = f"{start:%Y%m%d}_{end:%Y%m%d}" + ("_screened" if SCREENED else "")
     cs = os.path.join(args.cache_dir, f"obs_surface_{tag}.cache")
     cr = os.path.join(args.cache_dir, f"obs_rootzone_{tag}.cache")
     if os.path.exists(cs) and os.path.exists(cr) and not args.refresh_obs:
@@ -169,6 +187,29 @@ def load_obs(args, start, end):
         df.index = pd.to_datetime(df.index)
         df.columns = df.columns.astype(str)
     return s, r
+
+
+def metadata_from_depth_meta(ismn_dir):
+    """Station list from <ismn-dir>/depth_*/meta_depth_*.csv (screened or combined
+    products have no metadata_all_depths.csv)."""
+    fs = sorted(glob.glob(os.path.join(ismn_dir, "*", "meta_*.csv")))
+    if not fs:
+        return None
+    m = pd.concat([pd.read_csv(f, dtype=str) for f in fs], ignore_index=True)
+    if "site_id" not in m.columns:
+        m["site_id"] = m["series_id"]
+    out = os.path.join(ismn_dir, "_metadata_from_depth_meta.csv")
+    m.drop_duplicates("site_id").to_csv(out, index=False)
+    print(f"Metadata: {len(fs)} meta files -> {out}")
+    return out
+
+
+def detect_screened(ismn_dir):
+    """True if the 5 cm files carry the Type II screening column."""
+    fs = sorted(glob.glob(os.path.join(ismn_dir, "depth_005cm", "depth_005cm_*.csv")))
+    if not fs:
+        return False
+    return "sm_qaqc_screen" in pd.read_csv(fs[0], nrows=0).columns
 
 
 def load_metadata(path):
@@ -350,13 +391,21 @@ def main():
     ap.add_argument("--topojson", default=None,
                     help="Map outline file to embed (default: the copy "
                          "built into this script; 'none' to skip)")
+    ap.add_argument("--screened", action="store_true",
+                    help="Read Type II screened files (column sm_qaqc_screen)")
     ap.add_argument("--title", default="ISMN in-situ soil moisture")
     ap.add_argument("--output", default="ismn_insitu_dashboard.html")
     args = ap.parse_args()
+    global SCREENED
+    SCREENED = args.screened or detect_screened(args.ismn_dir)
+    if SCREENED:
+        print("Mode: Type II screened data (sm_qaqc_screen)")
 
     start, end = pd.Timestamp(args.start_date), pd.Timestamp(args.end_date)
-    meta = load_metadata(args.metadata or
-                         os.path.join(args.ismn_dir, "metadata_all_depths.csv"))
+    mpath = args.metadata or os.path.join(args.ismn_dir, "metadata_all_depths.csv")
+    if not args.metadata and not os.path.exists(mpath):
+        mpath = metadata_from_depth_meta(args.ismn_dir) or mpath
+    meta = load_metadata(mpath)
     obs_s, obs_r = load_obs(args, start, end)
 
     sites = sorted(set(obs_s.columns) | set(obs_r.columns))

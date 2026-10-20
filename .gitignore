@@ -1,1 +1,6 @@
 *~
+# local data and outputs (not committed)
+na_*/
+*_screened/
+dashboard_cache/
+*.html
