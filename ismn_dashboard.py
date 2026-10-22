@@ -53,6 +53,7 @@ import gzip
 import glob
 import json
 import os
+import re
 import sys
 
 import numpy as np
@@ -220,17 +221,22 @@ def load_obs(args, start, end):
 
 
 def metadata_from_depth_meta(ismn_dir):
-    """Station list from <ismn-dir>/depth_*/meta_depth_*.csv (screened or combined
-    products have no metadata_all_depths.csv)."""
-    fs = sorted(glob.glob(os.path.join(ismn_dir, "*", "meta_*.csv")))
+    """Station list from <dir>/depth_*/meta_*.csv (screened or combined products
+    have no metadata_all_depths.csv). The screened folder may have no meta files,
+    so the unscreened folder next to it (same name without _screened) is tried too."""
+    d = ismn_dir.rstrip("/")
+    for cand in [d, re.sub(r"_screened$", "", d)]:
+        fs = sorted(glob.glob(os.path.join(cand, "*", "meta_*.csv")))
+        if fs:
+            break
     if not fs:
         return None
     m = pd.concat([pd.read_csv(f, dtype=str) for f in fs], ignore_index=True)
     if "site_id" not in m.columns:
         m["site_id"] = m["series_id"]
-    out = os.path.join(ismn_dir, "_metadata_from_depth_meta.csv")
+    out = os.path.abspath("_metadata_from_depth_meta.csv")
     m.drop_duplicates("site_id").to_csv(out, index=False)
-    print(f"Metadata: {len(fs)} meta files -> {out}")
+    print(f"Metadata: {len(fs)} meta files in {cand} -> {out}")
     return out
 
 
@@ -244,7 +250,9 @@ def detect_screened(ismn_dir):
 
 def load_metadata(path):
     if not os.path.exists(path):
-        sys.exit(f"Metadata file not found: {path} (--metadata)")
+        sys.exit(f"Metadata file not found: {path}\n  No depth_*/meta_*.csv found either. "
+                 "Point --metadata to the unscreened folder, e.g.\n  "
+                 "--metadata /path/to/na_combined_v2_lifted_warm75")
     m = pd.read_csv(path)
     if "site_id" not in m.columns:
         m["site_id"] = m["network"] + "__" + m["station"]
@@ -397,8 +405,9 @@ def main():
     ap.add_argument("--ismn-dir", default="./na_ismn",
                     help="ISMN root with depth_XXXcm/ folders")
     ap.add_argument("--metadata", default=None,
-                    help="Station metadata CSV "
-                         "(default: <ismn-dir>/metadata_all_depths.csv)")
+                    help="Station metadata CSV, or a folder with depth_*/meta_*.csv "
+                         "(default: <ismn-dir>/metadata_all_depths.csv, else the meta "
+                         "files in <ismn-dir> or in the same folder without _screened)")
     ap.add_argument("--workers", type=int,
                     default=max(1, min(16, (os.cpu_count() or 2) - 1)),
                     help="Processes for reading the ISMN CSVs")
@@ -433,9 +442,12 @@ def main():
         print("Mode: Type II screened data (sm_qaqc_screen)")
 
     start, end = pd.Timestamp(args.start_date), pd.Timestamp(args.end_date)
-    mpath = args.metadata or os.path.join(args.ismn_dir, "metadata_all_depths.csv")
-    if not args.metadata and not os.path.exists(mpath):
-        mpath = metadata_from_depth_meta(args.ismn_dir) or mpath
+    if args.metadata and os.path.isdir(args.metadata):   # a folder with depth_*/meta_*.csv
+        mpath = metadata_from_depth_meta(args.metadata) or args.metadata
+    else:
+        mpath = args.metadata or os.path.join(args.ismn_dir, "metadata_all_depths.csv")
+        if not args.metadata and not os.path.exists(mpath):
+            mpath = metadata_from_depth_meta(args.ismn_dir) or mpath
     meta = load_metadata(mpath)
     obs = load_obs(args, start, end)
 
