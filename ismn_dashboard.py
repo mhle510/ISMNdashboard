@@ -9,40 +9,29 @@ unpin), or type a site_id in the search box. The output is ONE
 self-contained .html file (time series are compressed and embedded), so it
 can be copied off Discover and opened in any modern browser.
 
-Data
+Data (ismn_ref product, sm_qc s4_export.R)
 ----
-  Station list / coordinates : <ismn-dir>/metadata_all_depths.csv
-  Soil moisture              : <ismn-dir>/depth_XXXcm/depth_XXXcm_*.csv,
-                               read exactly as ismn_nldas_compare.py does
-                               (same QC flags, 5 cm surface, 0.1/0.3/0.6
-                               weighted 5/20/50 cm root zone), so what you see
-                               is what the validation uses.
+  Stations : <ismn-dir>/meta_final.csv (lat, lon, selected period, depths, expert review)
+  Depths   : <ismn-dir>/depth_XXXcm/depth_XXXcm_<YYYY>.csv
+             sm_raw, sm_qaqc (final: QC + expert review + gap filling), sm_flag, st_raw, st_qaqc
+  Surface   = 5 cm sm_qaqc, with 5 cm soil temperature (st_qaqc) on a second axis.
+  Root zone = 0.1/0.3/0.6 weighted layers from sm_qaqc (RZ_LAYERS), days with all three layers.
+  Switch "Show raw, removed and filled data" (surface only): sm_raw (all exported years, also
+  outside the selected period when the product was exported with full_raw), removed days
+  coloured by reason (sm_flag) and gap-filled days.
   Needs only numpy and pandas (pyarrow optional, for the cache).
-  The obs are cached in --cache-dir after the first run.
 
 Usage
 -----
-python ismn_dashboard.py --ismn-dir ./na_ismn \
-    --output ismn_insitu_dashboard.html
+python ismn_dashboard.py --ismn-dir products/ismn_ref_v1 --output ismn_ref_v1_dashboard.html
 
-Type II screened data (manual screening, screen_apply.R):
-python ismn_dashboard.py --ismn-dir ./na_combined_v2_lifted_warm75_screened \
-    --output na_ismn_umrb_screened.html
-  Detected automatically when the files have the column sm_qaqc_screen (or force
-  it with --screened): a day counts when sm_qaqc_screen has a value.
-  The page shows the screened SM by default, the 5 cm soil temperature (column st,
-  full record) in its own panel, and a "Show raw SM" switch that adds sm_raw in grey.
-  The obs cache is rebuilt automatically when a depth file is newer than it. Without
-  metadata_all_depths.csv, station coordinates come from the meta_depth_*.csv
-  files inside the depth folders.
-
-Optional: --exclude-networks SNOTEL ARM, --blacklist blacklist_stns.csv,
-          --start-date / --end-date (default 2002-01-01 .. 2024-12-31),
+Optional: --exclude-networks TxSON SOILSCAPE, --blacklist blacklist_stns.csv,
+          --start-date / --end-date (default 2001-01-01 .. 2025-12-31),
           --freq W (weekly means, smaller file).
 The page needs no internet access: plotly.js and the map outlines are
 embedded (use --plotly cdn for a ~1 MB smaller file if viewers are online).
 
-Author: Sujay Kumar; Oct 2026
+Author: Sujay Kumar; Oct 2026 (ismn_ref version: Hung Le)
 """
 
 import argparse
@@ -63,8 +52,14 @@ VARS = ("surface", "rootzone")
 SCALE = 1e3                     # SM stored as round(x * 1e3): 0.001 m3/m3
 ST_SCALE = 1e2                  # soil T stored as round(x * 1e2): 0.01 deg C
 # encoded series per station, in this order (the page decodes them the same way)
+FLAG_SCALE = 1                  # surface day category, stored as an integer
 SERIES = [("surface", SCALE), ("rootzone", SCALE), ("surface_raw", SCALE),
-          ("rootzone_raw", SCALE), ("surface_st", ST_SCALE)]
+          ("surface_st", ST_SCALE), ("surface_flag", FLAG_SCALE)]
+# sm_flag -> day category shown on the page (surface only)
+#   1 range, 2 stuck, 3 no valid soil T, 4 frozen, 6 period consistency, 7 outlier (34),
+#   8 expert review, 9 outside the selected period, 11 gap-filled (10, 50, 60, 80, 340); 0 observed
+FLAG_CAT = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 34: 7, 8: 8, 9: 9,
+            10: 11, 50: 11, 60: 11, 80: 11, 340: 11}
 PLOTLY_CDN = ("https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.2/"
               "plotly.min.js")
 TOPO_NAME = "north-america_50m"
@@ -81,7 +76,6 @@ TOPO_NAME = "north-america_50m"
 
 ISMN_DEPTH_DIRS = ["depth_005cm", "depth_010cm", "depth_015cm", "depth_020cm",
                    "depth_030cm", "depth_050cm", "depth_100cm"]
-VALID_FLAGS = {0, 10, 20, 50, 340}
 RZ_LAYERS = [                       # (candidate depths in order, weight)
     (["depth_005cm", "depth_010cm"],                0.1),
     (["depth_020cm", "depth_010cm", "depth_015cm"], 0.3),
@@ -89,77 +83,61 @@ RZ_LAYERS = [                       # (candidate depths in order, weight)
 ]
 
 
-SCREENED = False                    # set by --screened: read sm_qaqc_screen
-
-
-def _read_ismn_csv(fpath, screened=False):
-    """sm_qaqc (QC'd, or Type II screened), plus sm_raw and st when the file has them."""
+def _read_ismn_csv(fpath):
+    """sm_qaqc (final), sm_flag, sm_raw and st_qaqc of one depth x year file."""
     try:
         hdr = pd.read_csv(fpath, nrows=0).columns
-        extra = [c for c in ("sm_raw", "st") if c in hdr]
-        if screened:                # Type II screened files: removed days are already NA
-            d = pd.read_csv(fpath, parse_dates=["date"],
-                            usecols=["site_id", "date", "sm_qaqc_screen"] + extra)
-            d = d.rename(columns={"sm_qaqc_screen": "sm_qaqc"})
-            d["sm_flag"] = np.where(d["sm_qaqc"].notna(), "0", "-1")
-            return d
-        return pd.read_csv(fpath, parse_dates=["date"], dtype={"sm_flag": str},
-                           usecols=["site_id", "date", "sm_qaqc", "sm_flag"] + extra)
+        cols = [c for c in ("site_id", "date", "sm_qaqc", "sm_flag", "sm_raw", "st_qaqc") if c in hdr]
+        return pd.read_csv(fpath, parse_dates=["date"], dtype={"site_id": str}, usecols=cols)
     except Exception as e:
         print(f"  Warning: could not read {fpath}: {e}")
         return pd.DataFrame()
 
 
-def _flag_to_int(f):
-    try:
-        return int(float(f))
-    except (ValueError, TypeError):
-        return -1
-
-
 def load_ismn_depth_wide(ismn_dir, depth, start, end, workers):
-    """date x site_id frames for one depth folder: {'sm': QC-filtered (or screened)
-    SM, 'raw': sm_raw, 'st': soil temperature (full record, not screened)}."""
-    files = sorted(glob.glob(os.path.join(ismn_dir, depth, f"{depth}_*.csv")))
+    """date x site_id frames for one depth folder: 'sm' final sm_qaqc, 'raw' sm_raw,
+    'st' st_qaqc, 'flag' day category (FLAG_CAT)."""
+    files = sorted(glob.glob(os.path.join(ismn_dir, depth, f"{depth}_[0-9][0-9][0-9][0-9].csv")))
     if not files:
         return {}
     if workers > 1:
         from multiprocessing import Pool
         with Pool(min(workers, len(files))) as pool:
-            dfs = pool.map(partial(_read_ismn_csv, screened=SCREENED), files)
+            dfs = pool.map(_read_ismn_csv, files)
     else:
-        dfs = [_read_ismn_csv(f, SCREENED) for f in files]
+        dfs = [_read_ismn_csv(f) for f in files]
     dfs = [d for d in dfs if not d.empty]
     if not dfs:
         return {}
     d = pd.concat(dfs, ignore_index=True)
     d = d[(d["date"] >= start) & (d["date"] <= end)]
-    ok = d["sm_flag"].map(_flag_to_int).isin(VALID_FLAGS)
-    d["sm_valid"] = np.where(ok, pd.to_numeric(d["sm_qaqc"], errors="coerce"),
-                             np.nan)
+    if "sm_flag" in d.columns:
+        d["cat"] = pd.to_numeric(d["sm_flag"], errors="coerce").map(FLAG_CAT)
     out = {}
-    for k, c in (("sm", "sm_valid"), ("raw", "sm_raw"), ("st", "st")):
+    for k, c in (("sm", "sm_qaqc"), ("raw", "sm_raw"), ("st", "st_qaqc"), ("flag", "cat")):
         if c in d.columns:
             v = pd.to_numeric(d[c], errors="coerce")
-            if k == "st":
-                v = v.where((v >= -40) & (v <= 60))
-            out[k] = (d.assign(_v=v).groupby(["date", "site_id"])["_v"].mean()
+            out[k] = (d.assign(_v=v).groupby(["date", "site_id"])["_v"].max()
                       .unstack("site_id"))
     return out
 
 
 def build_rootzone_wide(by_depth):
-    """Weighted 3-layer root zone; all layers required on a given day."""
-    pieces = []
-    for cands, w in RZ_LAYERS:
-        for dname in cands:
-            if dname in by_depth and not by_depth[dname].empty:
-                pieces.append(by_depth[dname] * w)
-                break
-    if len(pieces) < len(RZ_LAYERS):     # a layer is missing (e.g. only 5 cm screened yet)
-        return pd.DataFrame()
-    comb = pd.concat(pieces, axis=1, keys=range(len(pieces)))
-    return comb.T.groupby(level=1).sum(min_count=len(pieces)).T
+    """Weighted 3-layer root zone (RZ_LAYERS). For each station and layer the first
+    candidate depth the STATION has is used; a day needs all three layers."""
+    sites = sorted(set().union(*[set(df.columns) for df in by_depth.values() if not df.empty]))
+    cols = {}
+    for sid in sites:
+        parts = []
+        for cands, w in RZ_LAYERS:
+            for dname in cands:
+                df = by_depth.get(dname)
+                if df is not None and not df.empty and sid in df.columns and df[sid].notna().any():
+                    parts.append(df[sid] * w)
+                    break
+        if len(parts) == len(RZ_LAYERS):
+            cols[sid] = pd.concat(parts, axis=1).sum(axis=1, min_count=len(parts))
+    return pd.DataFrame(cols)
 
 
 def _cache_write(df, path):
@@ -186,7 +164,7 @@ def load_obs(args, start, end):
     their raw counterparts and surface soil T. Cached per date range in
     --cache-dir; the cache is rebuilt when an input file is newer than it."""
     os.makedirs(args.cache_dir, exist_ok=True)
-    tag = f"{start:%Y%m%d}_{end:%Y%m%d}" + ("_screened" if SCREENED else "") + "_v2"
+    tag = f"{start:%Y%m%d}_{end:%Y%m%d}_ref_v3"
     paths = {k: os.path.join(args.cache_dir, f"obs_{k}_{tag}.cache") for k, _ in SERIES}
     have = all(os.path.exists(p) for p in paths.values())
     stale = have and _newest_input(args.ismn_dir) > min(os.path.getmtime(p) for p in paths.values())
@@ -197,7 +175,7 @@ def load_obs(args, start, end):
         if stale:
             print("Obs: input files are newer than the cache -> re-reading")
         print(f"Obs: reading depth files from {args.ismn_dir} ...")
-        by = {"sm": {}, "raw": {}, "st": {}}
+        by = {"sm": {}, "raw": {}, "st": {}, "flag": {}}
         for d in ISMN_DEPTH_DIRS:
             print(f"  {d} ...", end=" ", flush=True)
             w = load_ismn_depth_wide(args.ismn_dir, d, start, end, args.workers)
@@ -209,8 +187,8 @@ def load_obs(args, start, end):
         out = {"surface": by["sm"]["depth_005cm"],
                "rootzone": build_rootzone_wide(by["sm"]),
                "surface_raw": by["raw"]["depth_005cm"],
-               "rootzone_raw": build_rootzone_wide(by["raw"]),
-               "surface_st": by["st"]["depth_005cm"]}
+               "surface_st": by["st"]["depth_005cm"],
+               "surface_flag": by["flag"]["depth_005cm"]}
         for k, p in paths.items():
             _cache_write(out[k], p)
         print(f"  cached to {args.cache_dir}")
@@ -220,40 +198,10 @@ def load_obs(args, start, end):
     return out
 
 
-def metadata_from_depth_meta(ismn_dir):
-    """Station list from <dir>/depth_*/meta_*.csv (screened or combined products
-    have no metadata_all_depths.csv). The screened folder may have no meta files,
-    so the unscreened folder next to it (same name without _screened) is tried too."""
-    d = ismn_dir.rstrip("/")
-    for cand in [d, re.sub(r"_screened$", "", d)]:
-        fs = sorted(glob.glob(os.path.join(cand, "*", "meta_*.csv")))
-        if fs:
-            break
-    if not fs:
-        return None
-    m = pd.concat([pd.read_csv(f, dtype=str) for f in fs], ignore_index=True)
-    if "site_id" not in m.columns:
-        m["site_id"] = m["series_id"]
-    out = os.path.abspath("_metadata_from_depth_meta.csv")
-    m.drop_duplicates("site_id").to_csv(out, index=False)
-    print(f"Metadata: {len(fs)} meta files in {cand} -> {out}")
-    return out
-
-
-def detect_screened(ismn_dir):
-    """True if the 5 cm files carry the Type II screening column."""
-    fs = sorted(glob.glob(os.path.join(ismn_dir, "depth_005cm", "depth_005cm_*.csv")))
-    if not fs:
-        return False
-    return "sm_qaqc_screen" in pd.read_csv(fs[0], nrows=0).columns
-
-
 def load_metadata(path):
     if not os.path.exists(path):
-        sys.exit(f"Metadata file not found: {path}\n  No depth_*/meta_*.csv found either. "
-                 "Point --metadata to the unscreened folder, e.g.\n  "
-                 "--metadata /path/to/na_combined_v2_lifted_warm75")
-    m = pd.read_csv(path)
+        sys.exit(f"Metadata file not found: {path} (expected meta_final.csv of the ismn_ref product)")
+    m = pd.read_csv(path, dtype={"site_id": str, "station": str})
     if "site_id" not in m.columns:
         m["site_id"] = m["network"] + "__" + m["station"]
     m["site_id"] = m["site_id"].astype(str)
@@ -405,9 +353,7 @@ def main():
     ap.add_argument("--ismn-dir", default="./na_ismn",
                     help="ISMN root with depth_XXXcm/ folders")
     ap.add_argument("--metadata", default=None,
-                    help="Station metadata CSV, or a folder with depth_*/meta_*.csv "
-                         "(default: <ismn-dir>/metadata_all_depths.csv, else the meta "
-                         "files in <ismn-dir> or in the same folder without _screened)")
+                    help="Station table (default: <ismn-dir>/meta_final.csv)")
     ap.add_argument("--workers", type=int,
                     default=max(1, min(16, (os.cpu_count() or 2) - 1)),
                     help="Processes for reading the ISMN CSVs")
@@ -415,8 +361,8 @@ def main():
                     help="Where the obs parquet cache is kept")
     ap.add_argument("--refresh-obs", action="store_true",
                     help="Re-read ISMN files even if the obs cache exists")
-    ap.add_argument("--start-date", default="2002-01-01")
-    ap.add_argument("--end-date", default="2024-12-31")
+    ap.add_argument("--start-date", default="2001-01-01")
+    ap.add_argument("--end-date", default="2025-12-31")
     ap.add_argument("--freq", choices=("D", "W"), default="D",
                     help="D = daily (default), W = weekly means (smaller)")
     ap.add_argument("--exclude-networks", nargs="+", default=None)
@@ -431,24 +377,12 @@ def main():
     ap.add_argument("--topojson", default=None,
                     help="Map outline file to embed (default: the copy "
                          "built into this script; 'none' to skip)")
-    ap.add_argument("--screened", action="store_true",
-                    help="Read Type II screened files (column sm_qaqc_screen)")
-    ap.add_argument("--title", default="ISMN in-situ soil moisture")
-    ap.add_argument("--output", default="ismn_insitu_dashboard.html")
+    ap.add_argument("--title", default="ISMN reference soil moisture records")
+    ap.add_argument("--output", default="ismn_ref_dashboard.html")
     args = ap.parse_args()
-    global SCREENED
-    SCREENED = args.screened or detect_screened(args.ismn_dir)
-    if SCREENED:
-        print("Mode: Type II screened data (sm_qaqc_screen)")
 
     start, end = pd.Timestamp(args.start_date), pd.Timestamp(args.end_date)
-    if args.metadata and os.path.isdir(args.metadata):   # a folder with depth_*/meta_*.csv
-        mpath = metadata_from_depth_meta(args.metadata) or args.metadata
-    else:
-        mpath = args.metadata or os.path.join(args.ismn_dir, "metadata_all_depths.csv")
-        if not args.metadata and not os.path.exists(mpath):
-            mpath = metadata_from_depth_meta(args.ismn_dir) or mpath
-    meta = load_metadata(mpath)
+    meta = load_metadata(args.metadata or os.path.join(args.ismn_dir, "meta_final.csv"))
     obs = load_obs(args, start, end)
 
     sites = sorted(set(obs["surface"].columns) | set(obs["rootzone"].columns))
@@ -492,18 +426,25 @@ def main():
         if not any(stats.values()):
             continue
         stats["surface_raw"] = record_stats(daily[2])
-        stats["surface_st"] = st_stats(daily[4])
-        series = [s.resample("W").mean().values if args.freq == "W"
-                  else s.values for s in daily]
+        stats["surface_st"] = st_stats(daily[3])
+        fl = daily[4]
+        stats["n_filled"] = int((fl == 11).sum())
+        stats["n_removed"] = int(fl.isin([1, 2, 3, 4, 6, 7, 8]).sum())
+        if args.freq == "W":            # weekly: means; day category = the most severe of the week
+            series = [s.resample("W").max().values if k == "surface_flag"
+                      else s.resample("W").mean().values for s, (k, _) in zip(daily, SERIES)]
+        else:
+            series = [s.values for s in daily]
         m = meta.loc[sid]
         stations.append({
             "id": sid,
             "net": _clean(m.get("network")),
             "lat": round(float(m["lat"]), 4),
             "lon": round(float(m["lon"]), 4),
-            "elev": _clean(m.get("elevation_m")),
-            "lc": _clean(m.get("land_cover_desc")),
-            "clim": _clean(m.get("climate_koeppen")),
+            "elev": _clean(m.get("elevation", m.get("elevation_m"))),
+            "period": [_clean(m.get("period_start")), _clean(m.get("period_end"))],
+            "depths": _clean(m.get("depths_cm")),
+            "review": _clean(m.get("expert_review")),
             "st": stats,
         })
         blobs[sid] = encode_station(series)
@@ -520,7 +461,6 @@ def main():
         "n": int(len(out_dates)),
         "scale": SCALE,
         "scales": [sc for _, sc in SERIES],
-        "screened": SCREENED,
         "stations": stations,
         "series": blobs,
         "filters": {
@@ -666,7 +606,7 @@ th:first-child, td:first-child { text-align: left; }
       <span class="name" id="sname">No station selected</span>
       <span class="meta" id="smeta">Hover a station on the map; click to pin it.</span>
       <span class="chip" id="pin" hidden>Pinned · Esc to release</span>
-      <label class="toggle"><input type="checkbox" id="showraw"> Show raw SM</label>
+      <label class="toggle"><input type="checkbox" id="showraw"> Show raw, removed and filled data (surface)</label>
     </div>
     <div id="ts"><div class="empty">Hover over a station to see its time series.</div></div>
     <table id="stats" hidden></table>
@@ -693,7 +633,14 @@ const $ = id => document.getElementById(id);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const VNAME = {surface: 'Surface (5 cm)', rootzone: 'Root zone (0–100 cm)'};
 const SCALES = P.scales || [P.scale, P.scale];
-const SMLAB = P.screened ? 'Screened SM' : 'QC SM';
+const SMLAB = 'Final SM';
+// surface day categories (sm_flag mapped by the generator); dots drawn at the raw value
+const CATS = [
+  [1, 'Range check', '#d62728', 'circle'], [2, 'Stuck sensor', '#ff7f0e', 'circle'],
+  [3, 'No valid soil T', '#9467bd', 'circle'], [4, 'Frozen soil', '#1f77b4', 'circle'],
+  [6, 'Period consistency', '#8c564b', 'circle'], [7, 'Statistical outlier', '#e377c2', 'circle'],
+  [8, 'Expert review', '#e6a800', 'x-thin-open']];
+const FILLED = 11;
 
 $('title').textContent = P.title;
 $('subtitle').textContent = `${P.stations.length} stations · ` +
@@ -701,9 +648,9 @@ $('subtitle').textContent = `${P.stations.length} stations · ` +
 const f = P.filters, notes = [];
 if (f.excluded_networks.length) notes.push('Excluded networks: ' + f.excluded_networks.join(', '));
 if (f.blacklist) notes.push('Blacklist: ' + f.blacklist);
-notes.push((P.screened ? 'Type II screened soil moisture (sm_qaqc_screen); ' : 'QC-flagged values removed; ') +
-  'root zone = 0.1·5 cm + 0.3·20 cm + 0.6·50 cm, only on days with all three depths; ' +
-  'soil temperature (5 cm) is the full observed record; raw SM = sm_raw before QC.');
+notes.push('Final SM = sm_qaqc (QC, expert review, gaps of 1–9 days filled); ' +
+  'soil T = 5 cm st_qaqc; root zone = 0.1·(5|10 cm) + 0.3·(20|10|15 cm) + 0.6·(50|30|20 cm) from final SM, ' +
+  'only on days with all three layers; raw SM = sm_raw before QC, also outside the selected period.');
 $('foot').textContent = notes.join(' · ');
 
 /* ---------- theme toggle (auto -> light -> dark) ---------- */
@@ -907,52 +854,77 @@ async function drawSeries(id, force) {
   const lat = `${Math.abs(s.lat).toFixed(3)}°${s.lat >= 0 ? 'N' : 'S'}`;
   const lon = `${Math.abs(s.lon).toFixed(3)}°${s.lon >= 0 ? 'E' : 'W'}`;
   $('smeta').textContent = [s.net, `${lat} ${lon}`, s.elev ? `${Math.round(+s.elev)} m` : '',
-    s.lc, s.clim ? `Köppen ${s.clim}` : ''].filter(Boolean).join(' · ');
+    s.period && s.period[0] ? `period ${s.period[0]} to ${s.period[1]}` : '',
+    s.depths ? `depths ${s.depths.replace(/[;|]/g, ', ')} cm` : '',
+    s.review ? `review: ${s.review}` : ''].filter(Boolean).join(' · ');
   const d = await getSeries(id);
   if (id !== current) return;          // a newer hover won
   const ink = css('--ink'), ink2 = css('--ink-2'), grid = css('--grid'), axis = css('--axis');
-  const color = css('--series');
-  // SVG lines; days with no neighbours (isolated) get a marker so they show.
-  const stcol = css('--soilt') || '#8b2252', rawcol = css('--raw') || '#9a9a9a';
-  const tr = (y, ax, name, c = color, w = 1.4, unit = 'm³/m³', fmt = '.3f') => ({
-    type: 'scatter', mode: 'lines', x: dates, y, name, xaxis: 'x', yaxis: ax,
-    line: {color: c, width: w}, connectgaps: false, showlegend: false,
-    hovertemplate: `${name}: %{y:${fmt}} ${unit}<extra></extra>`,
+  const color = ink;                    // final SM black, as in the review pages
+  const stcol = css('--soilt') || '#a3245a', rawcol = css('--raw') || '#a8a8a4';
+  const SM = d[0], RZ = d[1], RAW = d[2], ST = d[3], FL = d[4];
+  const tr = (y, yax, name, c = color, w = 1.4, unit = 'm³/m³', fmt = '.3f', legend = true) => ({
+    type: 'scatter', mode: 'lines', x: dates, y, name, xaxis: 'x', yaxis: yax,
+    line: {color: c, width: w}, connectgaps: false, showlegend: legend,
+    hovertemplate: `%{y:${fmt}} ${unit}<extra>${name}</extra>`,
   });
-  const iso = (y, ax) => {
+  // single valid days between gaps get a marker so they show
+  const iso = (y, yax) => {
     const xs = [], ys = [];
     for (let i = 0; i < y.length; i++)
       if (y[i] !== null && (i === 0 || y[i - 1] === null) && (i === y.length - 1 || y[i + 1] === null)) {
         xs.push(dates[i]); ys.push(y[i]);
       }
-    return {type: 'scatter', mode: 'markers', x: xs, y: ys, xaxis: 'x', yaxis: ax, hoverinfo: 'skip',
+    return {type: 'scatter', mode: 'markers', x: xs, y: ys, xaxis: 'x', yaxis: yax, hoverinfo: 'skip',
             marker: {color, size: 4}, showlegend: false};
   };
+  const pts = (cat, y, name, c, sym, size) => {
+    const xs = [], ys = [];
+    for (let i = 0; i < FL.length; i++) if (FL[i] === cat && y[i] !== null) { xs.push(dates[i]); ys.push(y[i]); }
+    return xs.length ? {type: 'scatter', mode: 'markers', x: xs, y: ys, name: `${name} (${xs.length})`,
+      xaxis: 'x', yaxis: 'y', showlegend: true,
+      marker: {color: c, symbol: sym, size, line: {color: c, width: sym.startsWith('x') ? 1.5 : 0}},
+      hovertemplate: `%{y:.3f} m³/m³<extra>${name}</extra>`} : null;
+  };
+  // soil T axis: 1st-99th percentile of the record, padded; 0 °C always visible
+  const sv = (ST || []).filter(v => v !== null).sort((a, b) => a - b);
+  let stR = [-20, 40];
+  if (sv.length > 10) {
+    const lo = Math.min(0, sv[Math.floor(0.01 * (sv.length - 1))]), hi = Math.max(5, sv[Math.floor(0.99 * (sv.length - 1))]);
+    const pad = 0.10 * (hi - lo); stR = [lo - pad, hi + pad];
+  }
   const ax = extra => Object.assign({gridcolor: grid, linecolor: axis, zeroline: false,
     tickfont: {color: ink2, size: 11}}, extra);
   const head = v => VNAME[v] + (s.st[v] ? '' : ' · no data');
-  const showRaw = $('showraw').checked;
-  const has = (y) => y && y.some(v => v !== null);
+  const showRaw = $('showraw').checked && FL;
+  const has = y => y && y.some(v => v !== null);
+  // a thin line at every 1 January
+  const y0 = +P.start.slice(0, 4), y1 = +P.end.slice(0, 4), shapes = [];
+  for (let y = y0 + (P.start.slice(5) === '01-01' ? 0 : 1); y <= y1 + 1; y++)
+    shapes.push({type: 'line', xref: 'x', yref: 'paper', x0: `${y}-01-01`, x1: `${y}-01-01`, y0: 0, y1: 1,
+                 line: {color: grid, width: 1}, layer: 'below'});
+  const per = s.period && s.period[0] ? ` · selected period ${s.period[0]} to ${s.period[1]}` : '';
   const layout = {
     paper_bgcolor: css('--surface'), plot_bgcolor: css('--surface'),
-    margin: {l: 56, r: 12, t: 36, b: 30}, hovermode: 'x unified',
+    margin: {l: 56, r: 56, t: 36, b: 30}, hovermode: 'x unified', shapes,
     hoverlabel: {bgcolor: css('--surface'), bordercolor: axis, font: {color: ink, size: 12}},
     font: {family: 'system-ui, -apple-system, "Segoe UI", sans-serif', color: ink},
-    xaxis: ax({type: 'date', anchor: 'y2', range: [P.start, P.end],
+    legend: {orientation: 'h', x: 0, y: -0.07, yanchor: 'top', font: {size: 11, color: ink2}},
+    xaxis: ax({type: 'date', anchor: 'y2', range: [P.start, P.end], showgrid: false,
                showspikes: true, spikemode: 'across', spikethickness: 1, spikecolor: axis, spikedash: 'solid',
                rangeselector: {y: 1.09, x: 0, bgcolor: css('--page'), activecolor: css('--grid'),
                  font: {color: ink2, size: 11},
                  buttons: [{count: 1, label: '1y', step: 'year', stepmode: 'backward'},
                            {count: 5, label: '5y', step: 'year', stepmode: 'backward'},
                            {step: 'all', label: 'All'}]}}),
-    yaxis: ax({domain: [0.66, 1], title: {text: 'm³/m³', font: {color: ink2, size: 12}}}),
-    yaxis3: ax({domain: [0.37, 0.58], title: {text: '°C', font: {color: ink2, size: 12}},
-                zeroline: true, zerolinecolor: css('--ink-2'), zerolinewidth: 1}),
-    yaxis2: ax({domain: [0, 0.29], title: {text: 'm³/m³', font: {color: ink2, size: 12}}}),
+    yaxis: ax({domain: [0.42, 1], title: {text: 'SM (m³/m³)', font: {color: ink2, size: 12}}}),
+    yaxis3: ax({overlaying: 'y', side: 'right', anchor: 'x', showgrid: false, range: stR,
+                title: {text: 'Soil T (°C)', font: {color: stcol, size: 12}}, tickfont: {color: stcol, size: 11},
+                zeroline: false}),
+    yaxis2: ax({domain: [0, 0.30], range: s.st.rootzone ? undefined : [0, 0.6], title: {text: 'SM (m³/m³)', font: {color: ink2, size: 12}}}),
     annotations: [
-      {text: head('surface') + (showRaw ? ` · ${SMLAB} (blue), raw (grey)` : ` · ${SMLAB}`), x: 0, xref: 'paper', y: 1.0, yref: 'paper', yanchor: 'bottom', xanchor: 'left', showarrow: false, font: {size: 12, color: ink}},
-      {text: 'Soil temperature (5 cm, full record)' + (has(d[4]) ? '' : ' · no data'), x: 0, xref: 'paper', y: 0.58, yref: 'paper', yanchor: 'bottom', xanchor: 'left', showarrow: false, font: {size: 12, color: ink}},
-      {text: head('rootzone'), x: 0, xref: 'paper', y: 0.29, yref: 'paper', yanchor: 'bottom', xanchor: 'left', showarrow: false, font: {size: 12, color: ink}},
+      {text: head('surface') + ` · ${SMLAB} and soil T (5 cm)` + per, x: 0, xref: 'paper', y: 1.0, yref: 'paper', yanchor: 'bottom', xanchor: 'left', showarrow: false, font: {size: 12, color: ink}},
+      {text: head('rootzone') + (s.st.rootzone ? ` · ${SMLAB}` : ' (needs 5|10, 20|10|15 and 50|30|20 cm)'), x: 0, xref: 'paper', y: 0.30, yref: 'paper', yanchor: 'bottom', xanchor: 'left', showarrow: false, font: {size: 12, color: ink}},
     ],
   };
   if ($('ts').querySelector('.empty')) $('ts').innerHTML = '';
@@ -960,24 +932,31 @@ async function drawSeries(id, force) {
   const lay = $('ts').layout;
   if (lay && lay.xaxis && lay.xaxis.range && !force) layout.xaxis.range = lay.xaxis.range;
   const traces = [];
-  if (showRaw && d.length > 3) traces.push(tr(d[2], 'y', 'Surface raw', rawcol, 1), tr(d[3], 'y2', 'Root zone raw', rawcol, 1));
-  traces.push(tr(d[0], 'y', 'Surface'), tr(d[1], 'y2', 'Root zone'), iso(d[0], 'y'), iso(d[1], 'y2'));
-  if (d.length > 4) traces.push(tr(d[4], 'y3', 'Soil T', stcol, 1.1, '°C', '.1f'));
+  if (has(ST)) traces.push(Object.assign(tr(ST, 'y3', 'Soil T 5 cm', stcol, 0.7, '°C', '.1f'), {opacity: 0.45}));
+  if (showRaw && has(RAW)) traces.push(tr(RAW, 'y', 'Raw SM', rawcol, 0.9));
+  traces.push(tr(SM, 'y', 'Final SM'), iso(SM, 'y'));
+  if (showRaw) {
+    for (const [c, name, col, sym] of CATS) { const t = pts(c, RAW, 'Removed: ' + name, col, sym, sym.startsWith('x') ? 7 : 5); if (t) traces.push(t); }
+    const t = pts(FILLED, SM, 'Gap-filled', '#17becf', 'triangle-up', 7); if (t) traces.push(t);
+  }
+  traces.push(tr(RZ, 'y2', 'Root-zone SM', color, 1.4, 'm³/m³', '.3f', false), iso(RZ, 'y2'));
   Plotly.react('ts', traces, layout, {displaylogo: false, responsive: true});
   drawStats(s);
 }
 
 function drawStats(s) {
   const t = $('stats');
-  const NAMES = {surface: `Surface (5 cm) · ${SMLAB}`, surface_raw: 'Surface (5 cm) · raw SM',
+  const NAMES = {surface: `Surface (5 cm) · ${SMLAB}`, surface_raw: 'Surface (5 cm) · raw SM (all exported years)',
                  surface_st: 'Soil temperature (5 cm)', rootzone: VNAME.rootzone};
-  const rows = ['surface', 'surface_raw', 'surface_st', 'rootzone'].filter(v => v in s.st || v === 'surface' || v === 'rootzone').map(v => {
+  const rows = ['surface', 'surface_raw', 'surface_st', 'rootzone'].map(v => {
     const x = s.st[v];
     if (!x) return `<tr><td>${NAMES[v]}</td><td colspan="5" style="text-align:left;color:var(--muted)">no data</td></tr>`;
     const mean = v === 'surface_st' ? `${x.mean.toFixed(1)} °C (min ${x.min.toFixed(1)})` : x.mean.toFixed(3);
     return `<tr><td>${NAMES[v]}</td><td>${x.days.toLocaleString()}</td><td>${x.years}</td>` +
            `<td>${x.first}</td><td>${x.last}</td><td>${mean}</td></tr>`;
   });
+  if (s.st.surface) rows.push(`<tr><td>Surface days removed / gap-filled (selected period)</td>` +
+    `<td colspan="5" style="text-align:left">${(s.st.n_removed || 0).toLocaleString()} / ${(s.st.n_filled || 0).toLocaleString()}</td></tr>`);
   t.innerHTML = '<tr><th></th><th>Days with data</th><th>Years</th><th>First</th><th>Last</th><th>Mean</th></tr>' + rows.join('');
   t.hidden = false;
 }
