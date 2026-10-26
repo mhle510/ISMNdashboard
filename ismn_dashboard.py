@@ -881,7 +881,7 @@ async function drawSeries(id, force) {
   const pts = (cat, y, name, c, sym, size) => {
     const xs = [], ys = [];
     for (let i = 0; i < FL.length; i++) if (FL[i] === cat && y[i] !== null) { xs.push(dates[i]); ys.push(y[i]); }
-    return xs.length ? {type: 'scatter', mode: 'markers', x: xs, y: ys, name: `${name} (${xs.length})`,
+    return xs.length ? {type: 'scatter', mode: 'markers', x: xs, y: ys, name: `${name}: ${xs.length.toLocaleString()} days`,
       xaxis: 'x', yaxis: 'y', showlegend: true,
       marker: {color: c, symbol: sym, size, line: {color: c, width: sym.startsWith('x') ? 1.5 : 0}},
       hovertemplate: `%{y:.3f} m³/m³<extra>${name}</extra>`} : null;
